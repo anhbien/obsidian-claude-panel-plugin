@@ -1,0 +1,10 @@
+{
+  "id": "claude-panel",
+  "name": "Claude Panel",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Claude AI chat in the sidebar",
+  "author": "anhbien",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}
