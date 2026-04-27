@@ -8,6 +8,7 @@ import {
   Modal,
   Plugin,
   PluginSettingTab,
+  requestUrl,
   Setting,
   setIcon,
   TFile,
@@ -17,11 +18,16 @@ import {
 
 const VIEW_TYPE_CLAUDE = "claude-chat-view";
 
-const MODELS = [
-  { id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
-  { id: "claude-sonnet-4-6",          label: "Sonnet 4.6" },
-  { id: "claude-opus-4-7",            label: "Opus 4.7" },
-] as const;
+interface AnthropicModel {
+  id: string;
+  display_name: string;
+}
+
+const FALLBACK_MODELS: AnthropicModel[] = [
+  { id: "claude-opus-4-7",            display_name: "Claude Opus 4.7" },
+  { id: "claude-sonnet-4-6",          display_name: "Claude Sonnet 4.6" },
+  { id: "claude-haiku-4-5-20251001",  display_name: "Claude Haiku 4.5" },
+];
 
 // ── Interfaces ───────────────────────────────────────────────────────────────
 
@@ -141,6 +147,17 @@ const VAULT_TOOLS: Anthropic.Messages.Tool[] = [
       required: ["query"],
     },
   },
+  {
+    name: "fetch_webpage",
+    description: "Fetch the text content of a public web page. Use this to read articles, documentation, or any URL the user provides. Returns extracted readable text, not raw HTML.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        url: { type: "string", description: "The full URL to fetch, e.g. 'https://example.com/article'" },
+      },
+      required: ["url"],
+    },
+  },
 ];
 
 const TOOL_LABELS: Record<string, string> = {
@@ -152,6 +169,7 @@ const TOOL_LABELS: Record<string, string> = {
   create_folder: "Creating folder",
   delete_file: "Deleting",
   search_vault: "Searching",
+  fetch_webpage: "Fetching",
 };
 
 // ── File picker modal ────────────────────────────────────────────────────────
@@ -244,7 +262,7 @@ export class ClaudeView extends ItemView {
   private messages: MessageParam[] = [];
   private client: Anthropic | null = null;
   settings: ClaudeSettings;
-  private onSaveSettings: () => Promise<void>;
+  private onSaveSettings: (update?: Partial<ClaudeSettings>) => Promise<void>;
 
   // Context files
   private contextFiles: TFile[] = [];
@@ -256,6 +274,9 @@ export class ClaudeView extends ItemView {
   private sessionCreatedAt = 0;
   private displayMessages: DisplayMessage[] = [];
 
+  // Model list cache
+  private cachedModels: AnthropicModel[] | null = null;
+
   // DOM refs
   private messagesEl!: HTMLElement;
   private inputEl!: HTMLTextAreaElement;
@@ -263,7 +284,7 @@ export class ClaudeView extends ItemView {
   private modelSelectEl: HTMLSelectElement | null = null;
   private chipsEl: HTMLElement | null = null;
 
-  constructor(leaf: WorkspaceLeaf, settings: ClaudeSettings, onSave: () => Promise<void>) {
+  constructor(leaf: WorkspaceLeaf, settings: ClaudeSettings, onSave: (update?: Partial<ClaudeSettings>) => Promise<void>) {
     super(leaf);
     this.settings = { ...settings };
     this.onSaveSettings = onSave;
@@ -281,30 +302,23 @@ export class ClaudeView extends ItemView {
     // ── Toolbar ──────────────────────────────────────────────────────────────
     const toolbar = root.createDiv("claude-toolbar");
 
-    this.modelSelectEl = toolbar.createEl("select", { cls: "claude-model-select" });
-    for (const m of MODELS) {
-      const opt = this.modelSelectEl.createEl("option", { value: m.id, text: m.label });
-      if (m.id === this.settings.model) opt.selected = true;
-    }
-    this.modelSelectEl.addEventListener("change", async () => {
-      this.settings.model = this.modelSelectEl!.value;
-      this.client = null;
-      await this.onSaveSettings();
-    });
-
     const historyBtn = toolbar.createEl("button", {
       cls: "claude-icon-btn",
       attr: { "aria-label": "Chat history" },
     });
     setIcon(historyBtn, "history");
-    historyBtn.addEventListener("click", () => this.openHistory());
+    historyBtn.addEventListener("click", () => {
+      this.openHistory().catch((e) => { console.error("[Claude Panel]", e); });
+    });
 
     const newChatBtn = toolbar.createEl("button", {
       cls: "claude-icon-btn",
       attr: { "aria-label": "New chat" },
     });
     setIcon(newChatBtn, "square-pen");
-    newChatBtn.addEventListener("click", () => this.newChat());
+    newChatBtn.addEventListener("click", () => {
+      this.newChat().catch((e) => { console.error("[Claude Panel]", e); });
+    });
 
     // ── Messages ──────────────────────────────────────────────────────────────
     this.messagesEl = root.createDiv("claude-messages");
@@ -320,7 +334,21 @@ export class ClaudeView extends ItemView {
       attr: { placeholder: "Message Claude… (Enter to send, Shift+Enter for newline)" },
     });
 
-    const actions = footer.createDiv("claude-actions");
+    // ── Bottom bar: model switcher (left) + actions (right) ──────────────────
+    const bottomBar = footer.createDiv("claude-bottom-bar");
+
+    const modelWrapper = bottomBar.createDiv("claude-model-wrapper");
+    this.modelSelectEl = modelWrapper.createEl("select", { cls: "claude-model-select" });
+    modelWrapper.createSpan({ cls: "claude-model-chevron", text: "▾" });
+    this.modelSelectEl.addEventListener("change", async () => {
+      const model = this.modelSelectEl!.value;
+      this.settings.model = model;
+      this.client = null;
+      await this.onSaveSettings({ model });
+    });
+    this.populateModelSelect(this.cachedModels ?? FALLBACK_MODELS);
+
+    const actions = bottomBar.createDiv("claude-actions");
 
     const attachBtn = actions.createEl("button", {
       cls: "claude-icon-btn",
@@ -330,26 +358,38 @@ export class ClaudeView extends ItemView {
     attachBtn.addEventListener("click", () => this.openFilePicker());
 
     this.sendBtn = actions.createEl("button", { text: "Send", cls: "mod-cta" });
-    this.sendBtn.addEventListener("click", () => this.send());
+    this.sendBtn.addEventListener("click", () => {
+      this.send().catch((e) => { console.error("[Claude Panel]", e); });
+    });
 
     this.inputEl.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
-        this.send();
+        this.send().catch((err) => { console.error("[Claude Panel]", err); });
       }
     });
+
+    // Fetch live models in the background (updates select when ready)
+    this.loadModels();
   }
 
   updateSettings(settings: ClaudeSettings): void {
+    const apiKeyChanged = settings.apiKey !== this.settings.apiKey;
     this.settings = { ...settings };
     this.client = null;
     if (this.modelSelectEl) this.modelSelectEl.value = settings.model;
+    if (apiKeyChanged) {
+      this.cachedModels = null;
+      this.loadModels();
+    }
   }
 
   // ── Session management ───────────────────────────────────────────────────
 
   async newChat(): Promise<void> {
-    if (this.messages.length > 0) await this.autoSave();
+    if (this.messages.length > 0) {
+      try { await this.autoSave(); } catch (e) { console.error("[Claude Panel] autoSave:", e); }
+    }
     this.messages = [];
     this.displayMessages = [];
     this.currentSessionId = null;
@@ -367,7 +407,9 @@ export class ClaudeView extends ItemView {
   }
 
   private async openHistory(): Promise<void> {
-    if (this.messages.length > 0) await this.autoSave();
+    if (this.messages.length > 0) {
+      try { await this.autoSave(); } catch (e) { console.error("[Claude Panel] autoSave:", e); }
+    }
 
     const index = await this.loadIndex();
     const sessions = Object.values(index).sort((a, b) => b.updatedAt - a.updatedAt);
@@ -459,6 +501,48 @@ export class ClaudeView extends ItemView {
     }
   }
 
+  // ── Dynamic model loading ─────────────────────────────────────────────────
+
+  private async loadModels(): Promise<void> {
+    if (!this.settings.apiKey) return;
+    try {
+      const page = await this.getClient().models.list({ limit: 100 });
+      const models = (page.data as AnthropicModel[])
+        .filter((m) => (m as unknown as { type: string }).type === "model")
+        .sort((a, b) => {
+          const da = (a as unknown as { created_at: string }).created_at;
+          const db = (b as unknown as { created_at: string }).created_at;
+          return new Date(db).getTime() - new Date(da).getTime();
+        });
+      if (models.length > 0) {
+        this.cachedModels = models;
+        this.populateModelSelect(models);
+      }
+    } catch (err) {
+      console.warn("[Claude Panel] Could not fetch models:", err);
+    }
+  }
+
+  private populateModelSelect(models: AnthropicModel[]): void {
+    if (!this.modelSelectEl) return;
+    this.modelSelectEl.empty();
+    for (const m of models) {
+      const opt = this.modelSelectEl.createEl("option", {
+        value: m.id,
+        text: m.display_name,
+      });
+      if (m.id === this.settings.model) opt.selected = true;
+    }
+    // If the saved model isn't in the list, add it so nothing breaks
+    if (!models.find((m) => m.id === this.settings.model) && this.settings.model) {
+      const opt = this.modelSelectEl.createEl("option", {
+        value: this.settings.model,
+        text: this.settings.model,
+      });
+      opt.selected = true;
+    }
+  }
+
   // ── File picker ──────────────────────────────────────────────────────────
 
   private openFilePicker(): void {
@@ -536,11 +620,16 @@ export class ClaudeView extends ItemView {
     await this.appendMessage("user", text, attachedFiles);
     this.messages.push({ role: "user", content: apiContent });
 
-    const thinkingEl = this.showThinking();
+    let currentThinkingEl = this.showThinking();
 
     try {
       while (true) {
-        const response = await this.getClient().messages.create({
+        let streamRow: HTMLElement | null = null;
+        let streamBubble: HTMLElement | null = null;
+        let accumulatedText = "";
+        let thinkingRemovedThisRound = false;
+
+        const stream = this.getClient().messages.stream({
           model: this.settings.model,
           max_tokens: 4096,
           system: this.settings.systemPrompt || undefined,
@@ -548,17 +637,55 @@ export class ClaudeView extends ItemView {
           messages: this.messages,
         });
 
-        this.messages.push({ role: "assistant", content: response.content });
-
-        if (response.stop_reason === "tool_use") {
-          for (const block of response.content) {
-            if (block.type === "text" && block.text.trim()) {
-              thinkingEl.remove();
-              await this.appendMessage("assistant", block.text);
-            }
+        stream.on("text", (chunk: string) => {
+          if (!thinkingRemovedThisRound) {
+            currentThinkingEl.remove();
+            thinkingRemovedThisRound = true;
+            streamRow = this.messagesEl.createDiv("claude-row claude-row-assistant");
+            streamBubble = streamRow.createDiv("claude-bubble claude-bubble-assistant");
           }
+          accumulatedText += chunk;
+          this.scrollToBottom();
+        });
 
-          const toolUseBlocks = response.content.filter(
+        // Re-render as markdown every 80ms during streaming
+        let renderActive = false;
+        const renderInterval = setInterval(async () => {
+          if (!streamBubble || !accumulatedText || renderActive) return;
+          renderActive = true;
+          try {
+            streamBubble.empty();
+            await MarkdownRenderer.render(this.app, accumulatedText, streamBubble, "", this);
+            this.scrollToBottom();
+          } catch { /* ignore mid-stream errors */ }
+          renderActive = false;
+        }, 80);
+
+        const finalResponse = await stream.finalMessage();
+        clearInterval(renderInterval);
+
+        if (!thinkingRemovedThisRound) {
+          currentThinkingEl.remove();
+        }
+
+        // Wait for any in-progress mid-stream render before doing the final pass
+        while (renderActive) {
+          await new Promise<void>((r) => setTimeout(r, 5));
+        }
+
+        // Final markdown render with enhancements (copy buttons, link handlers)
+        if (streamBubble && accumulatedText.trim()) {
+          streamBubble.empty();
+          await MarkdownRenderer.render(this.app, accumulatedText, streamBubble, "", this);
+          this.addPostRenderEnhancements(streamBubble, streamRow!, accumulatedText);
+          this.displayMessages.push({ role: "assistant", text: accumulatedText });
+          this.scrollToBottom();
+        }
+
+        this.messages.push({ role: "assistant", content: finalResponse.content });
+
+        if (finalResponse.stop_reason === "tool_use") {
+          const toolUseBlocks = finalResponse.content.filter(
             (b): b is ToolUseBlock => b.type === "tool_use"
           );
           const toolResults: Anthropic.Messages.ToolResultBlockParam[] = [];
@@ -566,26 +693,21 @@ export class ClaudeView extends ItemView {
           for (const toolUse of toolUseBlocks) {
             const input = toolUse.input as Record<string, string>;
             const label = TOOL_LABELS[toolUse.name] ?? toolUse.name;
-            const detail = input.path ?? input.query ?? "";
+            const detail = input.path ?? input.query ?? input.url ?? "";
             this.appendToolStatus(`${label}: ${detail}`);
             const result = await this.executeTool(toolUse.name, input);
             toolResults.push({ type: "tool_result", tool_use_id: toolUse.id, content: result });
           }
 
           this.messages.push({ role: "user", content: toolResults });
+          currentThinkingEl = this.showThinking();
         } else {
-          thinkingEl.remove();
-          for (const block of response.content) {
-            if (block.type === "text" && block.text.trim()) {
-              await this.appendMessage("assistant", block.text);
-            }
-          }
           await this.autoSave();
           break;
         }
       }
     } catch (err: unknown) {
-      thinkingEl.remove();
+      currentThinkingEl.remove();
       const msg =
         err instanceof Error
           ? (err.message || err.name || "Unknown error")
@@ -652,12 +774,78 @@ export class ClaudeView extends ItemView {
           );
           return hits.length ? hits.map((f) => f.path).join("\n") : "No files found.";
         }
+        case "fetch_webpage": {
+          const resp = await requestUrl({ url: input.url, method: "GET" });
+          if (resp.status < 200 || resp.status >= 300) {
+            return `Error: server returned status ${resp.status}`;
+          }
+          const contentType = resp.headers["content-type"] ?? "";
+          if (!contentType.includes("html")) {
+            return resp.text.slice(0, 50000);
+          }
+          const extracted = this.extractPageText(resp.text);
+          const MAX = 50000;
+          if (extracted.length > MAX) {
+            return extracted.slice(0, MAX) + `\n\n[Truncated — ${extracted.length} chars total]`;
+          }
+          return extracted || "(No readable text found on page)";
+        }
         default:
           return `Error: unknown tool "${name}"`;
       }
     } catch (err: unknown) {
       return `Error: ${err instanceof Error ? err.message : String(err)}`;
     }
+  }
+
+  // ── Web helpers ──────────────────────────────────────────────────────────
+
+  private extractPageText(html: string): string {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, "text/html");
+
+    // Strip noise
+    doc.querySelectorAll(
+      "script, style, noscript, nav, footer, header, aside, iframe, [aria-hidden='true'], .ad, .ads, .advertisement"
+    ).forEach((el) => el.remove());
+
+    // Prefer semantic content containers
+    const main =
+      doc.querySelector("article, main, [role='main']") ??
+      doc.querySelector(".content, .post-content, .entry-content, #content, #main") ??
+      doc.body;
+
+    if (!main) return "";
+
+    // Walk the tree and build readable text preserving headings/paragraphs
+    const lines: string[] = [];
+    const walk = (node: Node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const t = node.textContent?.trim();
+        if (t) lines.push(t);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const el = node as Element;
+      const tag = el.tagName.toLowerCase();
+      if (["h1","h2","h3","h4","h5","h6"].includes(tag)) {
+        lines.push("\n## " + el.textContent?.trim());
+      } else if (tag === "li") {
+        lines.push("- " + el.textContent?.trim());
+      } else if (tag === "br") {
+        lines.push("");
+      } else {
+        el.childNodes.forEach(walk);
+        if (["p","div","section","blockquote","tr"].includes(tag)) lines.push("");
+      }
+    };
+    walk(main);
+
+    return lines
+      .join(" ")
+      .replace(/ {2,}/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
   }
 
   // ── UI helpers ───────────────────────────────────────────────────────────
@@ -684,13 +872,85 @@ export class ClaudeView extends ItemView {
     const bubble = row.createDiv(`claude-bubble claude-bubble-${role}`);
     if (role === "assistant") {
       await MarkdownRenderer.render(this.app, text, bubble, "", this);
+      this.addPostRenderEnhancements(bubble, row, text);
+    } else if (role === "error") {
+      bubble.createSpan({ text });
+      const dismissBtn = bubble.createEl("button", {
+        cls: "claude-error-dismiss",
+        attr: { "aria-label": "Dismiss" },
+      });
+      setIcon(dismissBtn, "x");
+      dismissBtn.addEventListener("click", () => row.remove());
     } else {
       bubble.setText(text);
+      const actions = row.createDiv("claude-msg-actions");
+      const copyBtn = actions.createEl("button", {
+        cls: "claude-icon-btn claude-msg-copy",
+        attr: { "aria-label": "Copy" },
+      });
+      setIcon(copyBtn, "copy");
+      copyBtn.addEventListener("click", () => {
+        navigator.clipboard.writeText(text).catch(() => {});
+      });
     }
     if (attachedFileNames?.length) {
       const label = row.createDiv("claude-attach-label");
-      label.setText("📎 " + attachedFileNames.join(", "));
+      label.appendText("📎 ");
+      for (let i = 0; i < attachedFileNames.length; i++) {
+        const name = attachedFileNames[i];
+        const fileSpan = label.createEl("span", { cls: "claude-attach-filename", text: name });
+        fileSpan.addEventListener("click", () => {
+          const file = this.app.vault.getFiles().find((f) => f.name === name);
+          if (file) this.app.workspace.getLeaf(false).openFile(file).catch(() => {});
+        });
+        if (i < attachedFileNames.length - 1) label.appendText(", ");
+      }
     }
+  }
+
+  private addPostRenderEnhancements(bubble: HTMLElement, row: HTMLElement, rawText: string): void {
+    // Copy buttons on code blocks
+    bubble.querySelectorAll("pre").forEach((pre) => {
+      const code = pre.querySelector("code");
+      const btn = document.createElement("button");
+      btn.className = "claude-copy-code-btn";
+      btn.textContent = "Copy";
+      pre.appendChild(btn);
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        navigator.clipboard.writeText(code?.textContent ?? "").catch(() => {});
+        btn.textContent = "Copied!";
+        setTimeout(() => { btn.textContent = "Copy"; }, 2000);
+      });
+    });
+
+    // Message copy button
+    const actions = row.createDiv("claude-msg-actions");
+    const copyBtn = actions.createEl("button", {
+      cls: "claude-icon-btn claude-msg-copy",
+      attr: { "aria-label": "Copy" },
+    });
+    setIcon(copyBtn, "copy");
+    copyBtn.addEventListener("click", () => {
+      navigator.clipboard.writeText(rawText).catch(() => {});
+    });
+
+    // External link handling
+    bubble.querySelectorAll("a.external-link").forEach((a) => {
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        window.open((a as HTMLAnchorElement).href, "_blank");
+      });
+    });
+
+    // Internal (vault) link handling
+    bubble.querySelectorAll("a.internal-link").forEach((a) => {
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        const href = a.getAttribute("data-href") ?? a.getAttribute("href") ?? "";
+        if (href) this.app.workspace.openLinkText(href, "", false);
+      });
+    });
   }
 
   private async appendMessage(
@@ -732,7 +992,10 @@ export default class ClaudePlugin extends Plugin {
     await this.loadSettings();
 
     this.registerView(VIEW_TYPE_CLAUDE, (leaf) => {
-      this.view = new ClaudeView(leaf, this.settings, () => this.saveSettings());
+      this.view = new ClaudeView(leaf, this.settings, async (update) => {
+        if (update) Object.assign(this.settings, update);
+        await this.saveSettings();
+      });
       return this.view;
     });
 

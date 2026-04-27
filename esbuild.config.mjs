@@ -5,7 +5,7 @@ import builtins from "builtin-modules";
 const prod = process.argv[2] === "production";
 
 const VAULT_PLUGIN_DIR =
-  "/Users/anhbien/Library/Mobile Documents/com~apple~CloudDocs/AB Obsidian Vault/AB Obsidian Vault/.obsidian/plugins/claude-panel";
+  "/Users/anhbien/Library/Mobile Documents/iCloud~md~obsidian/Documents/AB Obsidian Vault - iCloud/.obsidian/plugins/claude-panel";
 
 const context = await esbuild.context({
   entryPoints: ["main.ts"],

@@ -10,22 +10,11 @@
 .claude-toolbar {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
+  justify-content: flex-end;
+  gap: 4px;
+  padding: 4px 8px;
   border-bottom: 1px solid var(--background-modifier-border);
   flex-shrink: 0;
-}
-
-.claude-model-select {
-  flex: 1;
-  font-size: 12px;
-  background: var(--background-secondary);
-  color: var(--text-normal);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 4px;
-  padding: 3px 6px;
-  cursor: pointer;
-  min-width: 0;
 }
 
 .claude-icon-btn {
@@ -96,6 +85,7 @@
 .claude-bubble-assistant p:last-child  { margin-bottom: 0; }
 
 .claude-bubble-assistant pre {
+  position: relative;
   background: var(--background-primary);
   border: 1px solid var(--background-modifier-border);
   border-radius: 4px;
@@ -109,6 +99,26 @@
   color: var(--text-error, #fff);
   border-bottom-left-radius: 3px;
   border: 1px solid color-mix(in srgb, var(--background-modifier-error) 60%, #000);
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.claude-error-dismiss {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  color: inherit;
+  opacity: 0.6;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  margin-top: 1px;
+}
+
+.claude-error-dismiss:hover {
+  opacity: 1;
 }
 
 .claude-attach-label {
@@ -201,7 +211,53 @@
   color: var(--text-normal);
 }
 
-/* Input + actions */
+/* Bottom bar: model switcher + send actions */
+
+.claude-bottom-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.claude-model-wrapper {
+  display: inline-flex;
+  align-items: center;
+  position: relative;
+  gap: 2px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+
+.claude-model-select {
+  appearance: none;
+  -webkit-appearance: none;
+  border: none !important;
+  box-shadow: none !important;
+  outline: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-family: var(--font-interface);
+  cursor: pointer;
+  padding: 0 14px 0 0;
+}
+
+.claude-model-select:hover {
+  color: var(--text-normal);
+}
+
+.claude-model-chevron {
+  position: absolute;
+  right: 8px;
+  pointer-events: none;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1;
+}
+
+/* Input */
 
 .claude-input {
   width: 100%;
@@ -290,4 +346,72 @@
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
+}
+
+/* ── Code block copy button ──────────────────────────────────────────────── */
+
+.claude-copy-code-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  line-height: 1.4;
+  z-index: 1;
+}
+
+.claude-bubble-assistant pre:hover .claude-copy-code-btn {
+  opacity: 1;
+}
+
+/* ── Message action buttons ──────────────────────────────────────────────── */
+
+.claude-msg-actions {
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  margin-top: 2px;
+}
+
+.claude-row:hover .claude-msg-actions {
+  opacity: 1;
+}
+
+.claude-row-user .claude-msg-actions {
+  justify-content: flex-end;
+}
+
+.claude-row-assistant .claude-msg-actions {
+  justify-content: flex-start;
+}
+
+/* ── Attached file links ─────────────────────────────────────────────────── */
+
+.claude-attach-filename {
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.claude-attach-filename:hover {
+  color: var(--text-normal);
+}
+
+/* ── Links inside assistant bubbles ─────────────────────────────────────── */
+
+.claude-bubble-assistant a {
+  color: var(--link-color, var(--interactive-accent));
+  cursor: pointer;
+}
+
+.claude-bubble-assistant a:hover {
+  text-decoration: underline;
 }
