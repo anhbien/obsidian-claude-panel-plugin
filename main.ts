@@ -300,6 +300,7 @@ class ChatHistoryModal extends Modal {
 export class ClaudeView extends ItemView {
   // API state
   private messages: MessageParam[] = [];
+  private vaultContext = "";   // content of CLAUDE.md, loaded on open
   settings: ClaudeSettings;
   private onSaveSettings: (update?: Partial<ClaudeSettings>) => Promise<void>;
 
@@ -334,6 +335,14 @@ export class ClaudeView extends ItemView {
   getIcon(): string       { return "bot"; }
 
   async onOpen(): Promise<void> {
+    // Load CLAUDE.md as persistent vault context for every session
+    try {
+      const claudeFile = this.app.vault.getFileByPath("CLAUDE.md");
+      this.vaultContext = claudeFile ? await this.app.vault.read(claudeFile) : "";
+    } catch {
+      this.vaultContext = "";
+    }
+
     const root = this.containerEl.children[1] as HTMLElement;
     root.empty();
     root.addClass("claude-root");
@@ -621,6 +630,11 @@ export class ClaudeView extends ItemView {
   // ── Sending ──────────────────────────────────────────────────────────────
 
   private async callMessages(): Promise<MessagesResponse> {
+    const systemPrompt = [
+      this.vaultContext ? `<vault_context>\n${this.vaultContext}\n</vault_context>` : "",
+      this.settings.systemPrompt,
+    ].filter(Boolean).join("\n\n");
+
     const resp = await requestUrl({
       url: "https://api.anthropic.com/v1/messages",
       method: "POST",
@@ -632,7 +646,7 @@ export class ClaudeView extends ItemView {
       body: JSON.stringify({
         model: this.settings.model,
         max_tokens: 8096,
-        system: this.settings.systemPrompt || undefined,
+        system: systemPrompt || undefined,
         tools: VAULT_TOOLS,
         messages: this.messages,
       }),
