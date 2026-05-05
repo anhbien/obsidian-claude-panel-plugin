@@ -100,14 +100,15 @@ The model list is fetched live from the Anthropic API on panel open and cached i
 
 ## Important constraints & gotchas
 
+- **No external SDK — use `requestUrl` for all HTTP** — The plugin uses Obsidian's built-in `requestUrl` API (from `obsidian` module) for all Anthropic API calls. Do NOT add `@anthropic-ai/sdk` or any package that uses Node.js built-ins (`net`, `http`, `crypto`, etc.) — they will break the plugin on iOS (Obsidian iOS runs in WKWebView, not Node.js/Electron).
+- **No streaming** — `requestUrl` is a request/response API, not streaming. Responses appear all at once after the `●●●` thinking indicator. Do not try to re-add SSE streaming without a fully browser-compatible approach.
 - **All event listeners calling async methods must use `.catch()`** — unhandled rejections from plugin code cause Obsidian to display its own red error overlay. This was a past bug.
 - **`autoSave()` must be wrapped in try/catch** wherever it's called (`newChat`, `openHistory`) — file system errors would otherwise produce unhandled rejections.
 - **Error messages are not saved to `displayMessages`** — they only live in the DOM. This is intentional so errors don't pollute session history.
 - **`onOpen()` does not re-render existing messages** — if the view is re-opened (e.g. after a workspace reload), in-memory `displayMessages` won't be shown. The user needs to load a saved session via the history button.
-- **The Anthropic client is created lazily** in `getClient()` and reset to `null` when the API key or model changes.
-- **`dangerouslyAllowBrowser: true`** is required on the Anthropic client because Obsidian runs in Electron/browser context.
 - **`thinkingEl.remove()` is safe to call multiple times** — DOM's `.remove()` on a detached element is a no-op. The thinking element is created once per `send()` call and removed in whichever branch completes first.
 - **MarkdownRenderer is used for assistant messages only** — user and error messages use `setText()` to avoid rendering user input as markdown.
+- **esbuild output path** — `esbuild.config.mjs` outputs directly to the vault plugin directory at `/Users/anh.bien/Library/Mobile Documents/...`. Run `npm run build` after changes; toggle the plugin off/on in Obsidian to reload.
 
 ## CSS conventions
 
