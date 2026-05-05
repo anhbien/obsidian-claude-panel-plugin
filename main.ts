@@ -1,5 +1,3 @@
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, ToolUseBlock } from "@anthropic-ai/sdk/resources/messages";
 import {
   App,
   FuzzySuggestModal,
@@ -17,6 +15,48 @@ import {
 } from "obsidian";
 
 const VIEW_TYPE_CLAUDE = "claude-chat-view";
+
+// ── API types (local — no SDK dependency) ────────────────────────────────────
+
+interface MessageParam {
+  role: "user" | "assistant";
+  content: string | ContentBlock[];
+}
+
+type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlockParam;
+
+interface TextBlock {
+  type: "text";
+  text: string;
+}
+
+interface ToolUseBlock {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+interface ToolResultBlockParam {
+  type: "tool_result";
+  tool_use_id: string;
+  content: string;
+}
+
+interface MessagesResponse {
+  content: ContentBlock[];
+  stop_reason: string;
+}
+
+interface VaultTool {
+  name: string;
+  description: string;
+  input_schema: {
+    type: "object";
+    properties: Record<string, { type: string; description: string }>;
+    required: string[];
+  };
+}
 
 interface AnthropicModel {
   id: string;
@@ -65,7 +105,7 @@ interface ChatSession extends SessionMeta {
 
 // ── Vault tools ──────────────────────────────────────────────────────────────
 
-const VAULT_TOOLS: Anthropic.Messages.Tool[] = [
+const VAULT_TOOLS: VaultTool[] = [
   {
     name: "list_files",
     description: "List files and folders at a given path in the vault. Use an empty string for the vault root.",
@@ -260,7 +300,6 @@ class ChatHistoryModal extends Modal {
 export class ClaudeView extends ItemView {
   // API state
   private messages: MessageParam[] = [];
-  private client: Anthropic | null = null;
   settings: ClaudeSettings;
   private onSaveSettings: (update?: Partial<ClaudeSettings>) => Promise<void>;
 
@@ -376,7 +415,6 @@ export class ClaudeView extends ItemView {
   updateSettings(settings: ClaudeSettings): void {
     const apiKeyChanged = settings.apiKey !== this.settings.apiKey;
     this.settings = { ...settings };
-    this.client = null;
     if (this.modelSelectEl) this.modelSelectEl.value = settings.model;
     if (apiKeyChanged) {
       this.cachedModels = null;
@@ -506,14 +544,20 @@ export class ClaudeView extends ItemView {
   private async loadModels(): Promise<void> {
     if (!this.settings.apiKey) return;
     try {
-      const page = await this.getClient().models.list({ limit: 100 });
-      const models = (page.data as AnthropicModel[])
-        .filter((m) => (m as unknown as { type: string }).type === "model")
-        .sort((a, b) => {
-          const da = (a as unknown as { created_at: string }).created_at;
-          const db = (b as unknown as { created_at: string }).created_at;
-          return new Date(db).getTime() - new Date(da).getTime();
-        });
+      const resp = await requestUrl({
+        url: "https://api.anthropic.com/v1/models?limit=100",
+        method: "GET",
+        headers: {
+          "x-api-key": this.settings.apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        throw: false,
+      });
+      if (resp.status < 200 || resp.status >= 300) return;
+      const data = resp.json as { data: (AnthropicModel & { type: string; created_at: string })[] };
+      const models = data.data
+        .filter((m) => m.type === "model")
+        .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
       if (models.length > 0) {
         this.cachedModels = models;
         this.populateModelSelect(models);
@@ -576,11 +620,29 @@ export class ClaudeView extends ItemView {
 
   // ── Sending ──────────────────────────────────────────────────────────────
 
-  private getClient(): Anthropic {
-    if (!this.client) {
-      this.client = new Anthropic({ apiKey: this.settings.apiKey, dangerouslyAllowBrowser: true });
+  private async callMessages(): Promise<MessagesResponse> {
+    const resp = await requestUrl({
+      url: "https://api.anthropic.com/v1/messages",
+      method: "POST",
+      headers: {
+        "x-api-key": this.settings.apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: this.settings.model,
+        max_tokens: 8096,
+        system: this.settings.systemPrompt || undefined,
+        tools: VAULT_TOOLS,
+        messages: this.messages,
+      }),
+      throw: false,
+    });
+    if (resp.status < 200 || resp.status >= 300) {
+      const errBody = resp.json as { error?: { message?: string } };
+      throw new Error(errBody?.error?.message ?? `API error ${resp.status}`);
     }
-    return this.client;
+    return resp.json as MessagesResponse;
   }
 
   private async send(): Promise<void> {
@@ -624,61 +686,18 @@ export class ClaudeView extends ItemView {
 
     try {
       while (true) {
-        let streamRow: HTMLElement | null = null;
-        let streamBubble: HTMLElement | null = null;
-        let accumulatedText = "";
-        let thinkingRemovedThisRound = false;
+        const finalResponse = await this.callMessages();
+        currentThinkingEl.remove();
 
-        const stream = this.getClient().messages.stream({
-          model: this.settings.model,
-          max_tokens: 4096,
-          system: this.settings.systemPrompt || undefined,
-          tools: VAULT_TOOLS,
-          messages: this.messages,
-        });
-
-        stream.on("text", (chunk: string) => {
-          if (!thinkingRemovedThisRound) {
-            currentThinkingEl.remove();
-            thinkingRemovedThisRound = true;
-            streamRow = this.messagesEl.createDiv("claude-row claude-row-assistant");
-            streamBubble = streamRow.createDiv("claude-bubble claude-bubble-assistant");
-          }
-          accumulatedText += chunk;
-          this.scrollToBottom();
-        });
-
-        // Re-render as markdown every 80ms during streaming
-        let renderActive = false;
-        const renderInterval = setInterval(async () => {
-          if (!streamBubble || !accumulatedText || renderActive) return;
-          renderActive = true;
-          try {
-            streamBubble.empty();
-            await MarkdownRenderer.render(this.app, accumulatedText, streamBubble, "", this);
-            this.scrollToBottom();
-          } catch { /* ignore mid-stream errors */ }
-          renderActive = false;
-        }, 80);
-
-        const finalResponse = await stream.finalMessage();
-        clearInterval(renderInterval);
-
-        if (!thinkingRemovedThisRound) {
-          currentThinkingEl.remove();
-        }
-
-        // Wait for any in-progress mid-stream render before doing the final pass
-        while (renderActive) {
-          await new Promise<void>((r) => setTimeout(r, 5));
-        }
-
-        // Final markdown render with enhancements (copy buttons, link handlers)
-        if (streamBubble && accumulatedText.trim()) {
-          streamBubble.empty();
-          await MarkdownRenderer.render(this.app, accumulatedText, streamBubble, "", this);
-          this.addPostRenderEnhancements(streamBubble, streamRow!, accumulatedText);
-          this.displayMessages.push({ role: "assistant", text: accumulatedText });
+        // Render any text content
+        const textBlocks = finalResponse.content.filter((b): b is TextBlock => b.type === "text");
+        const assistantText = textBlocks.map((b) => b.text).join("");
+        if (assistantText.trim()) {
+          const row = this.messagesEl.createDiv("claude-row claude-row-assistant");
+          const bubble = row.createDiv("claude-bubble claude-bubble-assistant");
+          await MarkdownRenderer.render(this.app, assistantText, bubble, "", this);
+          this.addPostRenderEnhancements(bubble, row, assistantText);
+          this.displayMessages.push({ role: "assistant", text: assistantText });
           this.scrollToBottom();
         }
 
@@ -688,7 +707,7 @@ export class ClaudeView extends ItemView {
           const toolUseBlocks = finalResponse.content.filter(
             (b): b is ToolUseBlock => b.type === "tool_use"
           );
-          const toolResults: Anthropic.Messages.ToolResultBlockParam[] = [];
+          const toolResults: ToolResultBlockParam[] = [];
 
           for (const toolUse of toolUseBlocks) {
             const input = toolUse.input as Record<string, string>;
